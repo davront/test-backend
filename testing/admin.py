@@ -214,7 +214,7 @@ class AnswerOptionInlineFormSet(BaseInlineFormSet):
 
 class AnswerOptionNestedInline(nested_admin.NestedTabularInline):
     model = AnswerOption
-    extra = 4
+    extra = 0
     min_num = 2
     max_num = 10
     fields = ("text", "is_correct")
