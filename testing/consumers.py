@@ -104,6 +104,17 @@ class ProctoringConsumer(AsyncWebsocketConsumer):
         if isinstance(frame, bytes):
             import base64
             frame = "data:image/png;base64," + base64.b64encode(frame).decode("ascii")
+        elif isinstance(frame, str):
+            stripped = frame.strip()
+            if stripped.startswith("{"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        candidate = parsed.get("data") or parsed.get("frame")
+                        if isinstance(candidate, str):
+                            frame = candidate
+                except (ValueError, TypeError):
+                    pass
 
         await self.channel_layer.group_send(
             self.group,
