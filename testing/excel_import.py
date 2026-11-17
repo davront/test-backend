@@ -12,7 +12,7 @@ from .models import AnswerOption, Question, QuestionGroup, Test
 # B(1)  — question text
 # C(2)  — points (default 1)
 # D-K(3-10) — answer options (up to 8, blank cells skipped)
-# L(11) — correct answer(s), 1-based, comma-separated (e.g. "1" or "1,3")
+# L(11) — correct answer, 1-based (exactly one, e.g. "2")
 _OPTION_START = 3
 _OPTION_END = 11   # exclusive
 _CORRECT_COL = 11
@@ -84,11 +84,16 @@ def parse_excel(file_obj) -> list:
         except ValueError:
             raise ParseError(
                 f"Строка {row_num}: неверный формат правильного ответа «{correct_raw}». "
-                "Укажите номера через запятую, например: 1 или 1,3"
+                "Укажите номер варианта, например: 2"
             )
 
         if not correct_nums:
             raise ParseError(f"Строка {row_num}: не указан правильный ответ (столбец L).")
+        # В попытке на вопрос сохраняется один выбранный вариант — верный должен быть один.
+        if len(correct_nums) != 1:
+            raise ParseError(
+                f"Строка {row_num}: должен быть ровно один правильный ответ, указано «{correct_raw}»."
+            )
 
         correct_indices = []
         for n in correct_nums:

@@ -4,6 +4,8 @@ from django.contrib.admin import AdminSite
 class CustomAdminSite(AdminSite):
     def each_context(self, request):
         context = super().each_context(request)
+        if not request.user.has_perm("testing.view_testattempt"):
+            return context
         # Inject proctoring link into "Testing" app in sidebar
         for app in context.get("available_apps", []):
             if app["app_label"] == "testing":

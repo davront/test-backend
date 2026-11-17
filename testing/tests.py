@@ -136,4 +136,7 @@ class TestCuratorGroupTests(TestCase):
         self.assertNotIn("change_attemptresponse", codes)
         self.assertIn("add_user", codes)
         self.assertNotIn("delete_user", codes)
-        self.assertIn("change_group", codes)
+        # change_group позволял куратору выдать своей группе любые права.
+        self.assertNotIn("change_group", codes)
+        self.assertNotIn("add_group", codes)
+        self.assertIn("change_questiongroup", codes)

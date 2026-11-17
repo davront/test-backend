@@ -9,6 +9,8 @@ from django.db.models import Count, Q
 from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import UserChangeForm, UserCreationForm
+from django.contrib.auth.models import Group
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.forms.models import BaseInlineFormSet
 from django.http import HttpResponse
 from django.shortcuts import redirect, render
@@ -187,13 +189,80 @@ class UserAdmin(AdminActionLoggingMixin, BaseUserAdmin):
             obj.is_superuser = False
         super().save_model(request, obj, form, change)
 
+    # Не-суперпользователь управляет только обычными сотрудниками: иначе через
+    # смену пароля/групп staff-аккаунта (в т.ч. суперпользователя) он повышает себе права.
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        if request.user.is_superuser:
+            return qs
+        return qs.filter(is_staff=False, is_superuser=False)
+
+    def get_readonly_fields(self, request, obj=None):
+        # Флаги и личные права меняет только суперпользователь, иначе staff с change_user
+        # может сделать себе подобного суперпользователя.
+        fields = super().get_readonly_fields(request, obj)
+        if request.user.is_superuser:
+            return fields
+        return (*fields, "is_staff", "is_superuser", "user_permissions")
+
+    def _is_privileged_target(self, request, obj):
+        return (
+            obj is not None
+            and not request.user.is_superuser
+            and (obj.is_staff or obj.is_superuser)
+        )
+
+    def has_change_permission(self, request, obj=None):
+        if self._is_privileged_target(request, obj):
+            return False
+        return super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        if self._is_privileged_target(request, obj):
+            return False
+        return super().has_delete_permission(request, obj)
+
+    def formfield_for_manytomany(self, db_field, request, **kwargs):
+        if db_field.name == "groups" and not request.user.is_superuser:
+            kwargs["queryset"] = Group.objects.exclude(
+                name__in=(TEST_CURATOR_GROUP, AUDIT_LOG_VIEWERS_GROUP)
+            )
+        return super().formfield_for_manytomany(db_field, request, **kwargs)
+
 
 if admin.site.is_registered(User):
     admin.site.unregister(User)
 admin.site.register(User, UserAdmin)
 
 
-class AnswerOptionInlineFormSet(BaseInlineFormSet):
+class _KeepAnsweredInlineFormSet(BaseInlineFormSet):
+    """Не даёт удалить строку, на которую ссылаются ответы попыток (on_delete=PROTECT)."""
+
+    response_lookup = ""  # поле AttemptResponse, ведущее к удаляемому объекту
+
+    def clean(self):
+        super().clean()
+        for form in self.forms:
+            if not form.instance.pk or not self._should_delete_form(form):
+                continue
+            if AttemptResponse.objects.filter(**{self.response_lookup: form.instance}).exists():
+                raise ValidationError(
+                    _("«%(obj)s»: o'chirib bo'lmaydi — urinishlarda unga javob berilgan.")
+                    % {"obj": str(form.instance)[:60]}
+                )
+
+
+class QuestionGroupInlineFormSet(_KeepAnsweredInlineFormSet):
+    response_lookup = "question__group"
+
+
+class QuestionInlineFormSet(_KeepAnsweredInlineFormSet):
+    response_lookup = "question"
+
+
+class AnswerOptionInlineFormSet(_KeepAnsweredInlineFormSet):
+    response_lookup = "selected_option"
+
     def clean(self):
         super().clean()
         if any(self.errors):
@@ -226,6 +295,7 @@ class QuestionNestedInline(nested_admin.NestedStackedInline):
     fk_name = "group"
     extra = 0
     fields = ("order", "text", "points")
+    formset = QuestionInlineFormSet
     inlines = (AnswerOptionNestedInline,)
 
 
@@ -233,6 +303,7 @@ class QuestionGroupNestedInline(nested_admin.NestedStackedInline):
     model = QuestionGroup
     extra = 0
     fields = ("department", "order", "questions_to_show")
+    formset = QuestionGroupInlineFormSet
     inlines = (QuestionNestedInline,)
 
 
@@ -298,17 +369,20 @@ class TestAdmin(AdminActionLoggingMixin, nested_admin.NestedModelAdmin):
 
     def proctoring_view(self, request):
         from .constants import REGION_TYPE_CHOICES, VILOYAT_CHOICES, REGION_VILOYAT
+        if not request.user.has_perm("testing.view_testattempt"):
+            raise PermissionDenied
         from .services import sync_expired_attempt as _sync
         now = timezone.now()
         # sync_expired_attempt пересчитывает score_earned перед закрытием
+        # Срок: личный дедлайн или конец периода проведения теста (см. effective_deadline).
         for stale in TestAttempt.objects.filter(
-            status=AttemptStatus.IN_PROGRESS, deadline_at__lte=now
+            Q(deadline_at__lte=now) | Q(test__conduct_ends_at__lte=now),
+            status=AttemptStatus.IN_PROGRESS,
         ).select_related("test"):
             _sync(stale)
 
         qs = (
             TestAttempt.objects.filter(status=AttemptStatus.IN_PROGRESS)
-            .filter(Q(deadline_at__isnull=True) | Q(deadline_at__gt=now))
             .select_related("user", "test", "user__profile")
             .annotate(response_count=Count("responses"))
             .order_by("started_at")
@@ -346,6 +420,8 @@ class TestAdmin(AdminActionLoggingMixin, nested_admin.NestedModelAdmin):
         from .excel_import import ParseError, import_test, parse_excel
         from .models import AdminActionType
 
+        if not self.has_add_permission(request):
+            raise PermissionDenied
         if request.method == "POST":
             form = _TestImportForm(request.POST, request.FILES)
             if form.is_valid():
@@ -394,32 +470,15 @@ class TestAdmin(AdminActionLoggingMixin, nested_admin.NestedModelAdmin):
 class AttemptResponseInline(admin.TabularInline):
     model = AttemptResponse
     extra = 0
-    readonly_fields = ("is_correct", "answered_at")
+    # Ответ и is_correct фиксируются при сдаче; правка здесь не пересчитала бы балл.
+    readonly_fields = ("question", "selected_option", "is_correct", "answered_at")
 
     def get_queryset(self, request):
         qs = super().get_queryset(request)
         return qs.select_related("question", "selected_option")
 
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name == "question":
-            obj_id = request.resolver_match.kwargs.get("object_id")
-            if obj_id:
-                try:
-                    att = TestAttempt.objects.get(pk=obj_id)
-                    kwargs["queryset"] = Question.objects.filter(test=att.test)
-                except TestAttempt.DoesNotExist:
-                    pass
-        if db_field.name == "selected_option":
-            obj_id = request.resolver_match.kwargs.get("object_id")
-            if obj_id:
-                try:
-                    att = TestAttempt.objects.get(pk=obj_id)
-                    kwargs["queryset"] = AnswerOption.objects.filter(
-                        question__test=att.test
-                    )
-                except TestAttempt.DoesNotExist:
-                    pass
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+    def has_add_permission(self, request, obj=None):
+        return False
 
 
 class AttemptSessionEventInline(admin.TabularInline):
@@ -450,6 +509,15 @@ def _fmt_duration(seconds):
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+def _xlsx_text_only(row_cells):
+    """openpyxl пишет строку на «=» как формулу; оставляем её текстом (как ввод с ' в Excel),
+    без видимого префикса. Телефоны вида +998… и прочие значения не трогаем."""
+    for cell in row_cells:
+        if isinstance(cell.value, str) and cell.value.startswith("="):
+            cell.data_type = "s"
+            cell.quotePrefix = True
 
 
 @admin.action(description=_("Tanlangan urinishlarni Excelga eksport qilish"))
@@ -507,7 +575,7 @@ def export_attempts_xlsx(modeladmin, request, queryset):
         profile = getattr(obj.user, "profile", None)
         region_type = profile.get_region_type_display() if profile else "—"
         viloyat = (profile.get_viloyat_display() if profile and profile.viloyat else "—")
-        department = obj.user.groups.first()
+        department = next(iter(obj.user.groups.all()), None)  # из prefetch, без запроса
         pct = (
             round(float(obj.score_earned / obj.score_max * 100), 1)
             if obj.score_max
@@ -518,6 +586,11 @@ def export_attempts_xlsx(modeladmin, request, queryset):
             if obj.termination_reason
             else "—"
         )
+        total_q = (
+            len(obj.question_sequence)
+            if obj.question_sequence is not None
+            else obj._total_q
+        )
         ws.append([
             region_type,
             viloyat,
@@ -525,13 +598,14 @@ def export_attempts_xlsx(modeladmin, request, queryset):
             obj.user.username,
             department.name if department else "—",
             str(obj.test),
-            obj._total_q,
+            total_q,
             obj._answered,
             pct,
             termination,
             obj.started_at.strftime(fmt_dt) if obj.started_at else "—",
             obj.finished_at.strftime(fmt_dt) if obj.finished_at else "—",
         ])
+        _xlsx_text_only(ws[ws.max_row])
 
     col_widths = [18, 24, 28, 18, 20, 32, 14, 14, 12, 32, 18, 18]
     for col_idx, width in enumerate(col_widths, start=1):
@@ -773,7 +847,11 @@ class AttemptResponseAdmin(AdminActionLoggingMixin, admin.ModelAdmin):
     list_display = ("attempt", "question", "is_correct", "answered_at")
     list_filter = ("is_correct", "attempt__test")
     search_fields = ("attempt__user__username", "question__text")
-    readonly_fields = ("answered_at",)
+    # Ответ и is_correct фиксируются при сдаче; правка здесь не пересчитала бы балл.
+    readonly_fields = ("attempt", "question", "selected_option", "is_correct", "answered_at")
+
+    def has_add_permission(self, request):
+        return False
 
 
 
