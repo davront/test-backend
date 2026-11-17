@@ -42,3 +42,6 @@ Desktop.ini
 htmlcov/
 .pytest_cache/
 .mypy_cache/
+
+# Local dev server logs
+server_*.txt
