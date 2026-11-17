@@ -136,22 +136,26 @@ class TestListSerializer(serializers.ModelSerializer):
         return obj.is_conduct_period_open()
 
     def get_question_count(self, obj):
-        groups = list(obj.question_groups.all())
-        if not groups:
-            total = obj.questions.count()
-            n = obj.questions_to_show
-            return min(n, total) if n else total
+        """Сколько вопросов получит попытка — та же логика, что в services.start_attempt."""
+        all_count = getattr(obj, "question_count", None)
+        if all_count is None:
+            all_count = obj.questions.count()
         total = 0
-        for group in groups:
+        grouped = 0
+        for group in obj.question_groups.all():
             n = group.questions_to_show
             q_count = len(group.questions.all())
+            grouped += q_count
             total += min(n, q_count) if n else q_count
-        return total
+        total += max(0, all_count - grouped)  # вопросы без группы
+        n = obj.questions_to_show
+        return min(n, total) if n else total
 
 
 class TestDetailSerializer(serializers.ModelSerializer):
     questions = ExamQuestionSerializer(many=True, read_only=True)
     conduct_period_open = serializers.SerializerMethodField()
+    question_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Test
@@ -164,9 +168,12 @@ class TestDetailSerializer(serializers.ModelSerializer):
             "conduct_period_open",
             "time_limit_seconds",
             "is_active",
+            "question_count",
             "questions",
             "updated_at",
         )
+
+    get_question_count = TestListSerializer.get_question_count
 
     def get_conduct_period_open(self, obj):
         return obj.is_conduct_period_open()
@@ -180,32 +187,16 @@ class TestDetailSerializer(serializers.ModelSerializer):
         is_staff = getattr(user, "is_staff", False)
         user_pk = user.pk if user and user.is_authenticated else 0
 
-        if not is_staff:
-            seq = self.context.get("question_sequence")
-            if seq is not None:
-                # Активная попытка — фильтруем по sequence
-                seq_set = set(seq)
-                q_by_id = {q["id"]: q for q in questions if q["id"] in seq_set}
-                questions = [q_by_id[qid] for qid in seq if qid in q_by_id]
-            else:
-                # Нет активной попытки — применяем лимиты
-                groups = list(instance.question_groups.prefetch_related("questions").order_by("order"))
-                if groups:
-                    rng = random.Random(user_pk * 10 ** 6 + instance.pk)
-                    sampled_ids = set()
-                    for group in groups:
-                        gq_ids = list(group.questions.values_list("pk", flat=True))
-                        n = group.questions_to_show
-                        if n and n < len(gq_ids):
-                            gq_ids = rng.sample(gq_ids, n)
-                        sampled_ids.update(gq_ids)
-                    questions = [q for q in questions if q["id"] in sampled_ids]
-                else:
-                    # Нет групп — применяем questions_to_show на уровне теста
-                    n = instance.questions_to_show
-                    if n and n < len(questions):
-                        rng = random.Random(user_pk * 10 ** 6 + instance.pk)
-                        questions = rng.sample(questions, n)
+        seq = self.context.get("question_sequence")
+        if seq is not None:
+            # Активная попытка (в т.ч. у staff) — только её вопросы, в её порядке.
+            seq_set = set(seq)
+            q_by_id = {q["id"]: q for q in questions if q["id"] in seq_set}
+            questions = [q_by_id[qid] for qid in seq if qid in q_by_id]
+        elif not is_staff:
+            # Нет активной попытки — вопросы не показываем (иначе их можно
+            # прочитать до старта таймера); количество — в question_count.
+            questions = []
 
         if questions:
             rng = random.Random(user_pk * 10 ** 6 + instance.pk)
@@ -261,6 +252,13 @@ class AttemptSessionEventReadSerializer(serializers.ModelSerializer):
         )
 
 
+def _hide_score_in_progress(data, obj):
+    """Пока попытка идёт, балл не отдаём: по нему видно, верен ли ответ."""
+    if obj.status == AttemptStatus.IN_PROGRESS:
+        data["score_earned"] = None
+    return data
+
+
 class AttemptSerializer(serializers.ModelSerializer):
     test_id = serializers.IntegerField(source="test.id", read_only=True)
     test_title = serializers.CharField(source="test.title", read_only=True)
@@ -297,6 +295,9 @@ class AttemptSerializer(serializers.ModelSerializer):
             "next_question",
             "session_events",
         )
+
+    def to_representation(self, instance):
+        return _hide_score_in_progress(super().to_representation(instance), instance)
 
     def get_duration_seconds(self, obj):
         v = obj.duration_seconds
@@ -412,6 +413,9 @@ class AttemptListSerializer(serializers.ModelSerializer):
     def get_full_name(self, obj):
         name = obj.user.get_full_name().strip()
         return name if name else obj.user.username
+
+    def to_representation(self, instance):
+        return _hide_score_in_progress(super().to_representation(instance), instance)
 
 
 class SubmitAnswerSerializer(serializers.Serializer):
@@ -614,7 +618,15 @@ class TestWriteSerializer(serializers.ModelSerializer):
                     question=question, text=text, is_correct=is_correct
                 )
                 kept.add(opt.pk)
-        AnswerOption.objects.filter(question=question).exclude(pk__in=kept).delete()
+        stale = AnswerOption.objects.filter(question=question).exclude(pk__in=kept)
+        if AttemptResponse.objects.filter(selected_option__in=stale).exists():
+            raise serializers.ValidationError(
+                {
+                    "questions": f"Вопрос «{question.text[:50]}»: нельзя удалить вариант, "
+                    "который уже выбирали в попытках (передайте его id)."
+                }
+            )
+        stale.delete()
 
     @transaction.atomic
     def update(self, instance, validated_data):
@@ -649,5 +661,15 @@ class TestWriteSerializer(serializers.ModelSerializer):
                     )
                 kept_q.add(q.pk)
                 self._sync_options(q, options_data)
-            Question.objects.filter(test=instance).exclude(pk__in=kept_q).delete()
+            if not self.partial:
+                # PATCH не удаляет непереданные вопросы; PUT — заменяет набор целиком.
+                stale = Question.objects.filter(test=instance).exclude(pk__in=kept_q)
+                if AttemptResponse.objects.filter(question__in=stale).exists():
+                    raise serializers.ValidationError(
+                        {
+                            "questions": "Нельзя удалить вопросы, на которые уже отвечали "
+                            "в попытках. Передайте их id."
+                        }
+                    )
+                stale.delete()
         return instance

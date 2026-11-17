@@ -32,7 +32,9 @@ class IsTestAccessibleForUser(permissions.BasePermission):
 
 
 class IsAttemptOwnerOrStaff(permissions.BasePermission):
+    """Чтение: владелец или staff. Ответы/завершение/события — только владелец."""
+
     def has_object_permission(self, request, view, obj):
-        if request.user.is_staff:
+        if obj.user_id == request.user.id:
             return True
-        return obj.user_id == request.user.id
+        return request.method in permissions.SAFE_METHODS and request.user.is_staff

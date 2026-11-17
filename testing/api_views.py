@@ -1,4 +1,6 @@
-from django.db.models import Count, Prefetch, Q
+from django.contrib.auth import get_user_model
+from django.db import transaction
+from django.db.models import Count, Prefetch, ProtectedError, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, status
@@ -90,7 +92,7 @@ def _accessible_tests_qs(base, user):
             .annotate(_agc=Count("allowed_groups", distinct=True))
             .filter(Q(_agc=0) | Q(allowed_groups__in=user_groups))
             .distinct()
-        ).order_by("?")
+        ).order_by("-updated_at", "-id")
     )
 
 
@@ -152,7 +154,7 @@ class TestListView(generics.ListCreateAPIView):
         ).prefetch_related("allowed_groups", "question_groups__questions")
         user = self.request.user
         if user.is_staff:
-            return base.order_by("?")
+            return base.order_by("-updated_at", "-id")
         return _accessible_tests_qs(base, user)
 
     def create(self, request, *args, **kwargs):
@@ -181,24 +183,24 @@ class TestDetailView(generics.RetrieveUpdateDestroyAPIView):
         base = _test_queryset_staff_annotated()
         user = self.request.user
         if user.is_staff:
-            return base.order_by("?")
+            return base.order_by("-updated_at", "-id")
         return _accessible_tests_qs(base, user)
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
         context = self.get_serializer_context()
-        if not request.user.is_staff:
-            active_seq = (
-                TestAttempt.objects.filter(
-                    user=request.user,
-                    test=instance,
-                    status=AttemptStatus.IN_PROGRESS,
-                )
-                .values_list("question_sequence", flat=True)
-                .first()
+        # И для staff: если он сам проходит тест, показываем только вопросы его попытки.
+        active_seq = (
+            TestAttempt.objects.filter(
+                user=request.user,
+                test=instance,
+                status=AttemptStatus.IN_PROGRESS,
             )
-            if active_seq is not None:
-                context["question_sequence"] = active_seq
+            .values_list("question_sequence", flat=True)
+            .first()
+        )
+        if active_seq is not None:
+            context["question_sequence"] = active_seq
         return Response(TestDetailSerializer(instance, context=context).data)
 
     def update(self, request, *args, **kwargs):
@@ -217,6 +219,17 @@ class TestDetailView(generics.RetrieveUpdateDestroyAPIView):
             TestAuthoringDetailSerializer(test, context={"request": request}).data
         )
 
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        try:
+            instance.delete()
+        except ProtectedError:
+            return Response(
+                {"detail": "Тест нельзя удалить: по нему уже есть попытки. Снимите флаг «активен»."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 class StartAttemptView(APIView):
     permission_classes = [IsAuthenticated]
@@ -225,35 +238,43 @@ class StartAttemptView(APIView):
         test = get_object_or_404(Test.objects.prefetch_related("allowed_groups"), pk=pk)
         if not request.user.is_staff:
             if not user_can_access_test(request.user, test):
+                # Период проведения закончился — закрыть «висящую» попытку с баллом.
+                for att in TestAttempt.objects.filter(
+                    user=request.user, test=test, status=AttemptStatus.IN_PROGRESS
+                ):
+                    sync_expired_attempt(att)
                 return Response(
                     {
                         "detail": "Тест недоступен: срок проведения, флаг «активен» или доступ по отделу."
                     },
                     status=status.HTTP_403_FORBIDDEN,
                 )
-        existing_any = (
-            TestAttempt.objects.filter(user=request.user, test=test)
-            .order_by("-started_at")
-            .first()
-        )
-        if existing_any:
-            if existing_any.status == AttemptStatus.IN_PROGRESS:
-                sync_expired_attempt(existing_any)
-                existing_any.refresh_from_db()
-                if existing_any.status == AttemptStatus.IN_PROGRESS:
-                    att = _attempt_queryset_for_serializer().get(pk=existing_any.pk)
-                    return Response(
-                        AttemptSerializer(att, context={"request": request}).data,
-                        status=status.HTTP_200_OK,
-                    )
-            return Response(
-                {
-                    "detail": "Этот тест можно пройти только один раз. Повторное прохождение недоступно."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+        with transaction.atomic():
+            # Блокировка строки пользователя: параллельные POST не создадут две попытки.
+            get_user_model().objects.select_for_update().get(pk=request.user.pk)
+            existing_any = (
+                TestAttempt.objects.filter(user=request.user, test=test)
+                .order_by("-started_at")
+                .first()
             )
+            if existing_any:
+                if existing_any.status == AttemptStatus.IN_PROGRESS:
+                    sync_expired_attempt(existing_any)
+                    existing_any.refresh_from_db()
+                    if existing_any.status == AttemptStatus.IN_PROGRESS:
+                        att = _attempt_queryset_for_serializer().get(pk=existing_any.pk)
+                        return Response(
+                            AttemptSerializer(att, context={"request": request}).data,
+                            status=status.HTTP_200_OK,
+                        )
+                return Response(
+                    {
+                        "detail": "Этот тест можно пройти только один раз. Повторное прохождение недоступно."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        attempt = start_attempt(request.user, test)
+            attempt = start_attempt(request.user, test)
         att = _attempt_queryset_for_serializer().get(pk=attempt.pk)
         return Response(
             AttemptSerializer(att, context={"request": request}).data,
@@ -268,6 +289,10 @@ class AttemptListView(generics.ListAPIView):
     def get_queryset(self):
         qs = TestAttempt.objects.select_related("user", "test").order_by("-started_at")
         if not self.request.user.is_staff:
+            # Истёкшие попытки (лимит или конец периода) закрываются до выдачи результатов.
+            for att in qs.filter(user=self.request.user, status=AttemptStatus.IN_PROGRESS):
+                if att.is_expired():
+                    sync_expired_attempt(att)
             return qs.filter(user=self.request.user)
         test_id = self.request.query_params.get("test")
         user_id = self.request.query_params.get("user")

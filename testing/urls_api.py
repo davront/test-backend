@@ -35,13 +35,8 @@ urlpatterns = [
         name="api-attempt-abandon",
     ),
     path(
-        "attempts/<int:pk>/session-events/",
-        api_views.AttemptSessionEventCreateView.as_view(),
-        name="api-attempt-session-event",
-    ),
-    path(
         "attempts/<int:pk>/events/",
         api_views.AttemptSessionEventCreateView.as_view(),
-        name="api-attempt-events",
+        name="api-attempt-session-event",
     ),
 ]

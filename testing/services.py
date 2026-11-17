@@ -13,6 +13,7 @@ from django.db.models import DecimalField, OuterRef, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 
 from django.utils import timezone
+from rest_framework.settings import api_settings
 
 from .models import (
     AnswerOption,
@@ -58,24 +59,29 @@ def start_attempt(user, test: Test) -> TestAttempt:
     deadline = None
     if test.time_limit_seconds:
         deadline = now + timezone.timedelta(seconds=test.time_limit_seconds)
+        # Таймер не обещает больше времени, чем осталось до конца окна проведения
+        if test.conduct_ends_at and test.conduct_ends_at < deadline:
+            deadline = test.conduct_ends_at
 
-    groups = list(test.question_groups.prefetch_related("questions").order_by("order"))
-    if groups:
-        q_ids = []
-        for group in groups:
-            gq_ids = list(group.questions.values_list("pk", flat=True))
-            n = group.questions_to_show
-            if n and n < len(gq_ids):
-                gq_ids = random.sample(gq_ids, n)
-            q_ids.extend(gq_ids)
-        random.shuffle(q_ids)
+    # Каждая группа — свой пул со своим лимитом; вопросы без группы — отдельный пул.
+    # Лимит теста (questions_to_show) применяется к объединённому набору.
+    q_ids = []
+    for group in test.question_groups.order_by("order", "id"):
+        gq_ids = list(group.questions.values_list("pk", flat=True))
+        n = group.questions_to_show
+        if n and n < len(gq_ids):
+            gq_ids = random.sample(gq_ids, n)
+        q_ids.extend(gq_ids)
+    q_ids.extend(
+        test.questions.filter(group__isnull=True)
+        .order_by("order", "id")
+        .values_list("pk", flat=True)
+    )
+    n = test.questions_to_show
+    if n and n < len(q_ids):
+        q_ids = random.sample(q_ids, n)
     else:
-        q_ids = list(test.questions.order_by("order", "id").values_list("pk", flat=True))
-        n = test.questions_to_show
-        if n and n < len(q_ids):
-            q_ids = random.sample(q_ids, n)
-        else:
-            random.shuffle(q_ids)
+        random.shuffle(q_ids)
 
     max_pts = (
         Question.objects.filter(pk__in=q_ids).aggregate(total=Sum("points"))["total"] or 0
@@ -88,6 +94,15 @@ def start_attempt(user, test: Test) -> TestAttempt:
         deadline_at=deadline,
         score_max=max_pts,
         question_sequence=q_ids,
+    )
+
+
+def _lock_attempt(pk) -> TestAttempt:
+    """Блокирует строку попытки (только её, of=self); тест — тем же запросом для is_expired."""
+    return (
+        TestAttempt.objects.select_related("test")
+        .select_for_update(of=("self",))
+        .get(pk=pk)
     )
 
 
@@ -137,9 +152,10 @@ def _close_timed_out(attempt: TestAttempt, now=None) -> None:
     now = now or timezone.now()
     if attempt.status != AttemptStatus.IN_PROGRESS:
         return
+    deadline = attempt.effective_deadline()
     _save_scores_atomically(attempt, {
         "status": AttemptStatus.TIMED_OUT,
-        "finished_at": min(now, attempt.deadline_at) if attempt.deadline_at else now,
+        "finished_at": min(now, deadline) if deadline else now,
     })
 
 
@@ -150,7 +166,7 @@ def submit_answer(
 ) -> AttemptResponse:
     """Сохранить/обновить ответ на вопрос (upsert по паре попытка+вопрос)."""
     with transaction.atomic():
-        attempt = TestAttempt.objects.select_for_update().get(pk=attempt.pk)
+        attempt = _lock_attempt(attempt.pk)
         if attempt.is_expired():
             _close_timed_out(attempt)
             raise AttemptError("Время истекло.")
@@ -159,6 +175,9 @@ def submit_answer(
             raise AttemptError("Вопрос не из этого теста.")
         if selected_option.question_id != question.id:
             raise AttemptError("Вариант не относится к вопросу.")
+        seq = attempt.question_sequence
+        if seq is not None and question.id not in seq:
+            raise AttemptError("Вопрос не входит в эту попытку.")
         obj, _ = AttemptResponse.objects.update_or_create(
             attempt=attempt,
             question=question,
@@ -167,22 +186,16 @@ def submit_answer(
                 "is_correct": selected_option.is_correct,
             },
         )
-        seq = attempt.question_sequence
-        total_questions = len(seq) if seq else attempt.test.questions.count()
-        answered_questions = attempt.responses.count()
-        is_complete = total_questions > 0 and answered_questions >= total_questions
-        _save_scores_atomically(
-            attempt,
-            {"status": AttemptStatus.COMPLETED, "finished_at": timezone.now()}
-            if is_complete else None,
-        )
+        # Попытка не закрывается на последнем ответе: до complete_attempt
+        # пользователь может изменить любой ответ. score_earned не пересчитываем —
+        # иначе рост балла после ответа раскрывает верный вариант; считается при закрытии.
         return obj
 
 
 def complete_attempt(attempt: TestAttempt) -> TestAttempt:
     """Нормальное завершение (все вопросы или пользователь нажал «готово»)."""
     with transaction.atomic():
-        attempt = TestAttempt.objects.select_for_update().get(pk=attempt.pk)
+        attempt = _lock_attempt(attempt.pk)
         if attempt.status != AttemptStatus.IN_PROGRESS:
             return attempt
         if attempt.is_expired():
@@ -197,7 +210,7 @@ def complete_attempt(attempt: TestAttempt) -> TestAttempt:
 
 def abandon_attempt(attempt: TestAttempt) -> TestAttempt:
     with transaction.atomic():
-        attempt = TestAttempt.objects.select_for_update().get(pk=attempt.pk)
+        attempt = _lock_attempt(attempt.pk)
         if attempt.status != AttemptStatus.IN_PROGRESS:
             return attempt
         _save_scores_atomically(attempt, {
@@ -210,7 +223,7 @@ def abandon_attempt(attempt: TestAttempt) -> TestAttempt:
 def terminate_attempt(attempt: TestAttempt, reason: str) -> TestAttempt:
     """Принудительное закрытие (смена вкладки/приложения): score_earned = 0."""
     with transaction.atomic():
-        attempt = TestAttempt.objects.select_for_update().get(pk=attempt.pk)
+        attempt = _lock_attempt(attempt.pk)
         if attempt.status != AttemptStatus.IN_PROGRESS:
             return attempt
         # Не пересчитываем score_earned — при нарушении он обнуляется.
@@ -229,14 +242,19 @@ def terminate_attempt(attempt: TestAttempt, reason: str) -> TestAttempt:
 def sync_expired_attempt(attempt: TestAttempt) -> TestAttempt:
     """Если дедлайн прошёл, закрыть попытку (для фоновых задач / перед ответом)."""
     with transaction.atomic():
-        attempt = TestAttempt.objects.select_for_update().get(pk=attempt.pk)
+        attempt = _lock_attempt(attempt.pk)
         if attempt.status == AttemptStatus.IN_PROGRESS and attempt.is_expired():
             _close_timed_out(attempt)
         return attempt
 
 
 def get_request_client_ip(request) -> str | None:
+    num_proxies = api_settings.NUM_PROXIES
     forwarded = request.META.get("HTTP_X_FORWARDED_FOR")
-    if forwarded:
+    if forwarded and num_proxies:
+        # Та же логика, что у DRF throttling: адрес, добавленный ближайшим доверенным прокси.
+        addrs = forwarded.split(",")
+        return addrs[-min(num_proxies, len(addrs))].strip() or None
+    if forwarded and num_proxies is None:
         return forwarded.split(",")[0].strip() or None
     return request.META.get("REMOTE_ADDR")

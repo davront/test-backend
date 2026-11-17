@@ -268,11 +268,16 @@ class TestAttempt(models.Model):
             return None
         return (self.finished_at - self.started_at).total_seconds()
 
+    def effective_deadline(self):
+        """Ранний из: личный дедлайн (лимит времени) и конец периода проведения теста.
+        Без этого попытка теста без лимита никогда не закрывается сама."""
+        deadlines = [d for d in (self.deadline_at, self.test.conduct_ends_at) if d]
+        return min(deadlines) if deadlines else None
+
     def is_expired(self, now=None) -> bool:
         now = now or timezone.now()
-        if self.deadline_at and now >= self.deadline_at:
-            return True
-        return False
+        deadline = self.effective_deadline()
+        return bool(deadline and now >= deadline)
 
 
 class AttemptResponse(models.Model):
@@ -282,14 +287,15 @@ class AttemptResponse(models.Model):
         related_name="responses",
         verbose_name=_("Urinish"),
     )
+    # PROTECT: удаление вопроса/варианта не должно стирать историю ответов.
     question = models.ForeignKey(
         Question,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         verbose_name=_("Savol"),
     )
     selected_option = models.ForeignKey(
         AnswerOption,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         verbose_name=_("Tanlangan variant"),
     )
     is_correct = models.BooleanField(_("To'g'ri"), default=False)
@@ -314,6 +320,8 @@ class AttemptSessionEventType(models.TextChoices):
     PAGE_VISIBLE = "page_visible", _("Sahifa yana ko'rinmoqda")
     WINDOW_BLUR = "window_blur", _("Oyna fokusni yo'qotdi")
     WINDOW_FOCUS = "window_focus", _("Oyna fokusni oldi")
+    # Только фиксируется (перезагрузка/закрытие вкладки), попытку не прерывает.
+    PAGE_UNLOAD = "page_unload", _("Sahifa yopildi / yangilandi")
 
 
 class AttemptSessionEvent(models.Model):
