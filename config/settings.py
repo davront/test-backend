@@ -27,7 +27,7 @@ _sentry_dsn = os.environ.get("SENTRY_DSN", "").strip()
 if _sentry_dsn:
     sentry_sdk.init(
         dsn=_sentry_dsn,
-        environment="production" if not os.environ.get("DEBUG", "True") == "True" else "development",
+        environment="development" if os.environ.get("DEBUG", "False") == "True" else "production",
         traces_sample_rate=0.2,
         send_default_pii=False,
     )
@@ -42,7 +42,8 @@ SECRET_KEY = os.environ["SECRET_KEY"]
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # В продакшене задать через env: DEBUG=False
-DEBUG = os.environ.get("DEBUG", "True") == "True"
+# Для локальной разработки: DEBUG=True в .env
+DEBUG = os.environ.get("DEBUG", "False") == "True"
 
 # В продакшене задать через env: ALLOWED_HOSTS=example.com,www.example.com
 _allowed_hosts = os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1")
@@ -54,6 +55,8 @@ if _csrf_origins:
     CSRF_TRUSTED_ORIGINS = [x.strip() for x in _csrf_origins.split(",") if x.strip()]
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
 
 # CORS: для фронта на другом origin задайте CORS_ALLOWED_ORIGINS в env (через запятую).
 _cors = os.environ.get("CORS_ALLOWED_ORIGINS", "").strip()
@@ -75,6 +78,9 @@ REST_FRAMEWORK = {
     "EXCEPTION_HANDLER": "testing.api_exceptions.custom_exception_handler",
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    # Сколько доверенных прокси добавляют X-Forwarded-For перед Django.
+    # Не задано — XFF целиком (клиент может подделать IP и обойти throttle логина).
+    "NUM_PROXIES": int(os.environ["NUM_PROXIES"]) if os.environ.get("NUM_PROXIES") else None,
     "DEFAULT_THROTTLE_RATES": {
         # В продакшене ограничить: LOGIN_THROTTLE_RATE=5/min
         "login": os.environ.get("LOGIN_THROTTLE_RATE", "30/min"),
@@ -196,7 +202,7 @@ LANGUAGES = [
 
 LOCALE_PATHS = [BASE_DIR / 'locale']
 
-TIME_ZONE = 'Europe/Moscow'
+TIME_ZONE = 'Asia/Tashkent'
 
 USE_I18N = True
 
