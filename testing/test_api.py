@@ -1,8 +1,13 @@
+import io
+import os
+import tempfile
 from datetime import timedelta
 
 from channels.db import database_sync_to_async
 from django.contrib.auth.models import Group, Permission, User
-from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -14,6 +19,7 @@ from .models import (
     AnswerOption,
     AttemptResponse,
     AttemptSessionEvent,
+    AttemptSnapshot,
     AttemptStatus,
     Question,
     Test,
@@ -100,7 +106,15 @@ class ApiFlowTests(APITestCase):
         self.assertEqual(r.status_code, status.HTTP_201_CREATED)
         aid = r.data["id"]
 
-        # page_hidden — сохраняется и немедленно терминирует попытку
+        url = reverse("api-attempt-session-event", kwargs={"pk": aid})
+        # Первый уход — только предупреждение; blur + hidden подряд — один уход
+        for et, warn in (("window_blur", True), ("page_hidden", False)):
+            first = self.client.post(url, {"event_type": et}, format="json")
+            self.assertFalse(first.data["attempt_terminated"])
+            self.assertEqual(first.data["warning"], warn)
+        self.client.post(url, {"event_type": "page_visible"}, format="json")
+
+        # Второй уход — завершение
         ev = self.client.post(
             reverse("api-attempt-session-event", kwargs={"pk": aid}),
             {
@@ -127,12 +141,11 @@ class ApiFlowTests(APITestCase):
         )
         self.assertEqual(vis.status_code, status.HTTP_400_BAD_REQUEST)
 
-        # В истории только одно событие (page_hidden)
+        # В истории 4 события, отклонённое не записано
         detail = self.client.get(reverse("api-attempt-detail", kwargs={"pk": aid}))
         self.assertEqual(detail.status_code, status.HTTP_200_OK)
         self.assertIn("session_events", detail.data)
-        self.assertEqual(len(detail.data["session_events"]), 1)
-        self.assertEqual(detail.data["session_events"][0]["event_type"], "page_hidden")
+        self.assertEqual(len(detail.data["session_events"]), 4)
         self.assertEqual(detail.data["status"], "terminated")
 
         # Повторная проверка: закрытая попытка по-прежнему отклоняет события
@@ -441,6 +454,29 @@ class IntegrityAndPermissionTests(APITestCase):
         self.assertEqual(float(attempt.score_earned), 1.0)
         self.assertEqual(attempt.finished_at, ends)
 
+    def test_camera_off_counts_as_leave(self):
+        aid = self._start()
+        url = reverse("api-attempt-session-event", kwargs={"pk": aid})
+        post = lambda et: self.client.post(url, {"event_type": et}, format="json").data
+        # Камера выключена + клик по замку (blur) — одно нарушение: предупреждение
+        self.assertTrue(post("camera_off")["warning"])
+        self.assertFalse(post("window_blur")["warning"])
+        post("window_focus")
+        # Повторное выключение камеры — завершение
+        self.assertTrue(post("camera_off")["attempt_terminated"])
+        attempt = TestAttempt.objects.get(pk=aid)
+        self.assertEqual(attempt.status, AttemptStatus.TERMINATED)
+        self.assertEqual(attempt.termination_reason, "camera_off")
+
+    def test_devtools_counts_as_leave(self):
+        aid = self._start()
+        url = reverse("api-attempt-session-event", kwargs={"pk": aid})
+        post = lambda et: self.client.post(url, {"event_type": et}, format="json").data
+        self.assertTrue(post("devtools")["warning"])
+        post("window_focus")
+        self.assertTrue(post("devtools")["attempt_terminated"])
+        self.assertEqual(TestAttempt.objects.get(pk=aid).termination_reason, "devtools")
+
     def test_page_unload_is_recorded_without_termination(self):
         aid = self._start()
         r = self.client.post(
@@ -524,6 +560,17 @@ class AdminPermissionTests(TestCase):
         self.assertEqual(self.client.get(reverse("admin:testing_test_proctoring")).status_code, 200)
 
 
+    def test_proctoring_countdown_uses_effective_deadline(self):
+        ends = timezone.now() + timedelta(minutes=30)
+        test = Test.objects.create(title="P", is_active=True, conduct_ends_at=ends)
+        u = User.objects.create_user("stud", password="x")
+        TestAttempt.objects.create(
+            user=u, test=test, deadline_at=ends + timedelta(hours=1)
+        )
+        self.client.force_login(User.objects.create_superuser("root3", password="x"))
+        r = self.client.get(reverse("admin:testing_test_proctoring"))
+        self.assertContains(r, f'data-deadline="{timezone.localtime(ends).isoformat()}"')
+
 class ProctoringConsumerTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="cam", password="pass12345")
@@ -568,3 +615,70 @@ class ProctoringConsumerTests(APITestCase):
         out = await comm.receive_output()
         self.assertEqual(out, {"type": "websocket.close", "code": 4403})
         await comm.disconnect()
+
+
+_JPEG = b"\xff\xd8\xff\xe0" + b"0" * 100
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class AttemptSnapshotTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="snap", password="x")
+        self.test_obj = Test.objects.create(title="Snap", is_active=True)
+        self.client.force_authenticate(self.user)
+        r = self.client.post(reverse("api-test-start-attempt", kwargs={"pk": self.test_obj.pk}))
+        self.aid = r.data["id"]
+        self.url = reverse("api-attempt-snapshot", kwargs={"pk": self.aid})
+
+    def _upload(self, data=_JPEG, kind="camera", reason="periodic"):
+        return self.client.post(
+            self.url,
+            {"kind": kind, "reason": reason, "image": SimpleUploadedFile("s.jpg", data)},
+            format="multipart",
+        )
+
+    def test_upload_validation_and_throttle(self):
+        r = self._upload()
+        self.assertEqual(r.status_code, status.HTTP_201_CREATED)
+        snap = AttemptSnapshot.objects.get(pk=r.data["id"])
+        self.assertTrue(os.path.exists(snap.image.path))
+        self.assertEqual(self._upload(data=b"<svg/>").status_code, 400)
+        self.assertEqual(self._upload(kind="file").status_code, 400)
+        self.assertEqual(self._upload(reason="anything").status_code, 400)
+        for _ in range(11):
+            self.assertEqual(self._upload(kind="screen", reason="page_hidden").status_code, 201)
+        self.assertEqual(self._upload().status_code, 429)
+
+    def test_upload_allowed_shortly_after_finish(self):
+        attempt = TestAttempt.objects.get(pk=self.aid)
+        TestAttempt.objects.filter(pk=self.aid).update(
+            status=AttemptStatus.TERMINATED, finished_at=timezone.now()
+        )
+        self.assertEqual(self._upload(reason="window_blur").status_code, 201)
+        TestAttempt.objects.filter(pk=attempt.pk).update(
+            finished_at=timezone.now() - timedelta(seconds=30)
+        )
+        self.assertEqual(self._upload(reason="window_blur").status_code, 400)
+
+    def test_other_user_cannot_upload(self):
+        self.client.force_authenticate(User.objects.create_user(username="other", password="x"))
+        self.assertIn(self._upload().status_code, (403, 404))
+
+    def test_admin_view_and_cleanup(self):
+        snap = AttemptSnapshot.objects.get(pk=self._upload().data["id"])
+        url = reverse("admin:testing_testattempt_snapshot", args=[self.aid, snap.pk])
+        self.client.force_authenticate(None)
+        self.client.force_login(User.objects.create_user("plainstaff", password="x", is_staff=True))
+        self.assertEqual(self.client.get(url).status_code, 403)
+        self.client.force_login(User.objects.create_superuser("root4", password="x"))
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(b"".join(r.streaming_content), _JPEG)
+
+        path = snap.image.path
+        AttemptSnapshot.objects.filter(pk=snap.pk).update(
+            created_at=timezone.now() - timedelta(days=31)
+        )
+        call_command("cleanup_snapshots", stdout=io.StringIO())
+        self.assertFalse(AttemptSnapshot.objects.filter(pk=snap.pk).exists())
+        self.assertFalse(os.path.exists(path))

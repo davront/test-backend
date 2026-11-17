@@ -39,4 +39,9 @@ urlpatterns = [
         api_views.AttemptSessionEventCreateView.as_view(),
         name="api-attempt-session-event",
     ),
+    path(
+        "attempts/<int:pk>/snapshots/",
+        api_views.AttemptSnapshotCreateView.as_view(),
+        name="api-attempt-snapshot",
+    ),
 ]

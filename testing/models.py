@@ -1,7 +1,11 @@
+import uuid
+
 from django.conf import settings
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
@@ -193,6 +197,9 @@ class AttemptStatus(models.TextChoices):
 class TerminationReason(models.TextChoices):
     TAB_SWITCH = "tab_switch", _("Boshqa vkladkaga o'tildi")
     WINDOW_BLUR = "window_blur", _("Boshqa ilovaga o'tildi")
+    CAMERA_OFF = "camera_off", _("Kamera o'chirildi")
+    SCREEN_OFF = "screen_off", _("Ekran ulashish to'xtatildi")
+    DEVTOOLS = "devtools", _("Dasturchi vositalari (DevTools)")
 
 
 class TestAttempt(models.Model):
@@ -322,6 +329,12 @@ class AttemptSessionEventType(models.TextChoices):
     WINDOW_FOCUS = "window_focus", _("Oyna fokusni oldi")
     # Только фиксируется (перезагрузка/закрытие вкладки), попытку не прерывает.
     PAGE_UNLOAD = "page_unload", _("Sahifa yopildi / yangilandi")
+    # Test paytida kamera o'chdi / ruxsat olib qo'yildi — chiqish kabi hisoblanadi.
+    CAMERA_OFF = "camera_off", _("Kamera o'chirildi")
+    # Ekran ulashish to'xtatildi (yoki F5 dan keyin qayta ulashilmadi) — chiqish kabi.
+    SCREEN_OFF = "screen_off", _("Ekran ulashish to'xtatildi")
+    # F12 / Ctrl+Shift+I va h.k. — test paytida DevTools ochishga urinish
+    DEVTOOLS = "devtools", _("Dasturchi vositalari (DevTools)")
 
 
 class AttemptSessionEvent(models.Model):
@@ -451,3 +464,42 @@ class AdminActionLog(models.Model):
     def __str__(self):
         who = self.actor.username if self.actor else "unknown"
         return f"{who}: {self.get_action_type_display()} {self.model_name}#{self.object_id}"
+
+
+class SnapshotKind(models.TextChoices):
+    CAMERA = "camera", _("Kamera")
+    SCREEN = "screen", _("Ekran")
+
+
+def _snapshot_path(instance, filename):
+    return f"snapshots/{instance.attempt_id}/{uuid.uuid4().hex}.jpg"
+
+
+class AttemptSnapshot(models.Model):
+    """Kamera/ekran surati: davriy yoki qoidabuzarlik paytida. MEDIA_ROOT da, ochiq URL'siz."""
+
+    attempt = models.ForeignKey(
+        TestAttempt,
+        on_delete=models.CASCADE,
+        related_name="snapshots",
+        verbose_name=_("Urinish"),
+    )
+    kind = models.CharField(_("Turi"), max_length=10, choices=SnapshotKind.choices)
+    # "periodic" yoki hodisa turi (page_hidden, window_blur, camera_off, ...)
+    reason = models.CharField(_("Sabab"), max_length=32, blank=True)
+    image = models.FileField(_("Surat"), upload_to=_snapshot_path)
+    created_at = models.DateTimeField(_("Vaqt"), auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ("created_at",)
+        verbose_name = _("Surat")
+        verbose_name_plural = _("Suratlar")
+
+    def __str__(self):
+        return f"{self.get_kind_display()} #{self.attempt_id} {self.created_at:%H:%M:%S}"
+
+
+@receiver(post_delete, sender=AttemptSnapshot)
+def _delete_snapshot_file(sender, instance, **kwargs):
+    # CASCADE/queryset.delete() ham fayl qoldirmasin
+    instance.image.delete(save=False)

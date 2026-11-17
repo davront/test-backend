@@ -12,9 +12,9 @@ from django.contrib.auth.forms import UserChangeForm, UserCreationForm
 from django.contrib.auth.models import Group
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.forms.models import BaseInlineFormSet
-from django.http import HttpResponse
-from django.shortcuts import redirect, render
-from django.urls import path
+from django.http import FileResponse, HttpResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import path, reverse
 from django.utils import timezone
 from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
@@ -27,6 +27,7 @@ from .models import (
     AttemptResponse,
     AttemptSessionEvent,
     AttemptSessionEventType,
+    AttemptSnapshot,
     AttemptStatus,
     Question,
     QuestionGroup,
@@ -400,6 +401,7 @@ class TestAdmin(AdminActionLoggingMixin, nested_admin.NestedModelAdmin):
             total_questions = len(attempt.question_sequence) if attempt.question_sequence else 0
             attempt.current_question = min(attempt.response_count + 1, total_questions) if total_questions else 0
             attempt.current_question_display = f"{attempt.current_question}/{total_questions}" if total_questions else "—"
+            attempt.deadline = attempt.effective_deadline()
 
         show_viloyat = (region_type == REGION_VILOYAT) or (not region_type)
         context = {
@@ -501,6 +503,35 @@ class AttemptSessionEventInline(admin.TabularInline):
         return False
 
 
+class AttemptSnapshotInline(admin.TabularInline):
+    model = AttemptSnapshot
+    extra = 0
+    can_delete = False
+    max_num = 0
+    fields = ("created_at", "kind", "reason", "preview")
+    readonly_fields = fields
+    ordering = ("created_at",)
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_view_permission(self, request, obj=None):
+        # Отдельного права на снимки нет: видит тот, кто видит попытку
+        return request.user.has_perm("testing.view_testattempt")
+
+    @admin.display(description=_("Surat"))
+    def preview(self, obj: AttemptSnapshot):
+        url = reverse("admin:testing_testattempt_snapshot", args=[obj.attempt_id, obj.pk])
+        return format_html(
+            '<a href="{0}" target="_blank" rel="noopener">'
+            '<img src="{0}" loading="lazy" alt="" style="max-height:120px;border-radius:4px"></a>',
+            url,
+        )
+
+
 def _fmt_duration(seconds):
     if seconds is None:
         return "—"
@@ -539,6 +570,9 @@ def export_attempts_xlsx(modeladmin, request, queryset):
     _termination_labels = {
         "tab_switch": "Boshqa vkladkaga o'tganligi sababli",
         "window_blur": "Boshqa ilovaga o'tganligi sababli",
+        "camera_off": "Kamera o'chirilganligi sababli",
+        "screen_off": "Ekran ulashish to'xtatilganligi sababli",
+        "devtools": "DevTools ochishga urinish sababli",
     }
 
     headers = [
@@ -660,8 +694,28 @@ class TestAttemptAdmin(AdminActionLoggingMixin, admin.ModelAdmin):
         "score_max",
     )
     autocomplete_fields = ("user", "test")
-    inlines = (AttemptResponseInline, AttemptSessionEventInline)
+    inlines = (AttemptResponseInline, AttemptSessionEventInline, AttemptSnapshotInline)
     actions = ("action_sync_timeout", export_attempts_xlsx)
+
+    def get_urls(self):
+        return [
+            path(
+                "<int:attempt_id>/snapshot/<int:pk>/",
+                self.admin_site.admin_view(self.snapshot_view),
+                name="testing_testattempt_snapshot",
+            ),
+        ] + super().get_urls()
+
+    def snapshot_view(self, request, attempt_id, pk):
+        """Файл снимка только через админку: публичного MEDIA_URL нет."""
+        if not self.has_view_permission(request):
+            raise PermissionDenied
+        if not self.get_queryset(request).filter(pk=attempt_id).exists():
+            raise PermissionDenied
+        snap = get_object_or_404(AttemptSnapshot, pk=pk, attempt_id=attempt_id)
+        response = FileResponse(snap.image.open("rb"), content_type="image/jpeg")
+        response["Cache-Control"] = "private, max-age=3600"
+        return response
 
     def get_inline_instances(self, request, obj=None):
         inlines = super().get_inline_instances(request, obj)
@@ -700,6 +754,9 @@ class TestAttemptAdmin(AdminActionLoggingMixin, admin.ModelAdmin):
         labels = {
             "tab_switch": "Boshqa vkladkaga o'tdi",
             "window_blur": "Boshqa ilovaga o'tdi",
+            "camera_off": "Kamera o'chirildi",
+            "screen_off": "Ekran ulashish to'xtatildi",
+            "devtools": "DevTools ochishga urindi",
         }
         reason = obj.termination_reason
         if not reason:

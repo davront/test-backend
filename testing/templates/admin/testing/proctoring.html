@@ -70,9 +70,9 @@
       <div><strong>Начат:</strong> {{ attempt.started_at|date:"SHORT_DATETIME_FORMAT" }}</div>
       <div><strong>Вопрос:</strong> {{ attempt.current_question_display }}</div>
       <div><strong>Окончание:</strong>
-        {% if attempt.deadline_at %}
-          {{ attempt.deadline_at|date:"SHORT_DATETIME_FORMAT" }}
-          (<span class="deadline-countdown" data-deadline="{{ attempt.deadline_at|date:'c' }}">расчет...</span>)
+        {% if attempt.deadline %}
+          {{ attempt.deadline|date:"SHORT_DATETIME_FORMAT" }}
+          (<span class="deadline-countdown" data-deadline="{{ attempt.deadline|date:'c' }}">расчет...</span>)
         {% else %}
           без лимита
         {% endif %}

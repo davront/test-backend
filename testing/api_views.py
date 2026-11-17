@@ -5,6 +5,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
@@ -13,10 +14,12 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import (
     AnswerOption,
+    AttemptSnapshot,
     AttemptSessionEvent,
     AttemptSessionEventType,
     AttemptStatus,
     Question,
+    SnapshotKind,
     Test,
     TestAttempt,
 )
@@ -370,6 +373,10 @@ class AbandonAttemptView(generics.GenericAPIView):
         return Response(AttemptSerializer(attempt, context={"request": request}).data)
 
 
+# Сколько уходов со страницы прощается предупреждением; следующий завершает попытку.
+LEAVE_WARNINGS = 1
+
+
 class AttemptSessionEventCreateView(generics.GenericAPIView):
     """Логирование visibility/blur с клиента во время активной попытки."""
 
@@ -399,15 +406,30 @@ class AttemptSessionEventCreateView(generics.GenericAPIView):
         _terminate_on = {
             AttemptSessionEventType.PAGE_HIDDEN: "tab_switch",
             AttemptSessionEventType.WINDOW_BLUR: "window_blur",
+            AttemptSessionEventType.CAMERA_OFF: "camera_off",
+            AttemptSessionEventType.SCREEN_OFF: "screen_off",
+            AttemptSessionEventType.DEVTOOLS: "devtools",
         }
         was_terminated = False
+        warning = False
         from django.conf import settings as _s
         termination_enabled = not getattr(_s, "DISABLE_TERMINATION", False)
         if termination_enabled and inst.event_type in _terminate_on:
-            attempt.refresh_from_db()
-            if attempt.status == AttemptStatus.IN_PROGRESS:
-                terminate_attempt(attempt, _terminate_on[inst.event_type])
-                was_terminated = True
+            # Уход = blur/hidden/camera_off, перед которым было возвращение (focus/visible/unload).
+            # Нарушения подряд (camera_off + blur на замок адресной строки) — один уход. Первый — предупреждение, следующий — завершение.
+            leaves, prev, new_leave = 0, None, False
+            events = attempt.session_events.filter(pk__lte=inst.pk).order_by("pk")
+            for et in events.values_list("event_type", flat=True):
+                new_leave = et in _terminate_on and prev not in _terminate_on
+                leaves += new_leave
+                prev = et
+            if new_leave and leaves > LEAVE_WARNINGS:
+                attempt.refresh_from_db()
+                if attempt.status == AttemptStatus.IN_PROGRESS:
+                    terminate_attempt(attempt, _terminate_on[inst.event_type])
+                    was_terminated = True
+            elif new_leave:
+                warning = True
 
         return Response(
             {
@@ -415,9 +437,60 @@ class AttemptSessionEventCreateView(generics.GenericAPIView):
                 "event_type": inst.event_type,
                 "created_at": inst.created_at,
                 "attempt_terminated": was_terminated,
+                "warning": warning,
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+_SNAPSHOT_MAX_BYTES = 512 * 1024
+_SNAPSHOTS_PER_MINUTE = 12  # davriy 2/30s + qoidabuzarlik suratlari; ortig'i — disk to'ldirish
+_SNAPSHOT_GRACE = timezone.timedelta(seconds=15)
+
+
+class AttemptSnapshotCreateView(generics.GenericAPIView):
+    """Kamera/ekran surati (JPEG) faol urinish davomida: multipart kind, reason, image."""
+
+    permission_classes = [IsAuthenticated, IsAttemptOwnerOrStaff]
+    queryset = _attempt_queryset_for_serializer()
+    lookup_url_kwarg = "pk"
+    parser_classes = [MultiPartParser]
+
+    def post(self, request, *args, **kwargs):
+        attempt = self.get_object()
+        if attempt.status == AttemptStatus.IN_PROGRESS:
+            attempt = sync_expired_attempt(attempt)
+        # Завершающее нарушение снимается ~1 с после события — к этому моменту попытка уже закрыта
+        just_finished = attempt.finished_at and timezone.now() - attempt.finished_at < _SNAPSHOT_GRACE
+        if attempt.status != AttemptStatus.IN_PROGRESS and not just_finished:
+            return Response({"detail": "Urinish yakunlangan."}, status=status.HTTP_400_BAD_REQUEST)
+
+        kind = request.data.get("kind")
+        reason = request.data.get("reason") or ""
+        image = request.FILES.get("image")
+        if kind not in SnapshotKind.values:
+            return Response({"kind": "Noto'g'ri tur."}, status=status.HTTP_400_BAD_REQUEST)
+        if reason != "periodic" and reason not in AttemptSessionEventType.values:
+            return Response({"reason": "Noto'g'ri sabab."}, status=status.HTTP_400_BAD_REQUEST)
+        # Faqat JPEG (magic bytes) va hajm chegarasi: ixtiyoriy fayl diskka tushmasin
+        if (
+            image is None
+            or image.size > _SNAPSHOT_MAX_BYTES
+            or image.read(3) != b"\xff\xd8\xff"
+        ):
+            return Response({"image": "JPEG kerak (≤512 KB)."}, status=status.HTTP_400_BAD_REQUEST)
+        image.seek(0)
+
+        recent = attempt.snapshots.filter(
+            created_at__gte=timezone.now() - timezone.timedelta(minutes=1)
+        ).count()
+        if recent >= _SNAPSHOTS_PER_MINUTE:
+            return Response(status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        snap = AttemptSnapshot.objects.create(
+            attempt=attempt, kind=kind, reason=reason, image=image
+        )
+        return Response({"id": snap.pk}, status=status.HTTP_201_CREATED)
 
 
 class HealthView(APIView):

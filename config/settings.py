@@ -215,6 +215,11 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+# Снимки прокторинга. Публичного MEDIA_URL нет: отдаются только через админку с проверкой прав.
+# В проде MEDIA_ROOT — постоянный том (volume), иначе снимки пропадут при передеплое.
+MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", BASE_DIR / "media"))
+SNAPSHOT_RETENTION_DAYS = int(os.environ.get("SNAPSHOT_RETENTION_DAYS", "30"))
+
 DATA_UPLOAD_MAX_NUMBER_FIELDS = 10000
 
 # Default primary key field type
